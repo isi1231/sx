@@ -2,8 +2,7 @@ import time
 
 from openai import OpenAI
 
-from app.config import  DEEPSEEK_API_KEY, DEEPSEEK_MODEL
-
+from app.config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL
 
 client = OpenAI(
     api_key=DEEPSEEK_API_KEY,
@@ -11,22 +10,13 @@ client = OpenAI(
 )
 
 
-def chat(user_message: str) -> str:
+def chat(messages: list[dict[str, str]]) -> str:
     start_time = time.perf_counter()
 
     try:
         response = client.chat.completions.create(
             model=DEEPSEEK_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "你是一个专业、简洁的 AI 助手。",
-                },
-                {
-                    "role": "user",
-                    "content": user_message,
-                },
-            ],
+            messages=messages,
             temperature=0.2,
             timeout=30,
         )
@@ -41,3 +31,31 @@ def chat(user_message: str) -> str:
     except Exception as exc:
         print(f"[DeepSeek ERROR] {exc}")
         return "模型服务暂时不可用，请稍后重试。"
+
+
+def stream_chat(messages: list[dict[str, str]]):
+    start_time = time.perf_counter()
+
+    try:
+        response = client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=messages,
+            temperature=0.2,
+            timeout=30,
+            stream=True,
+        )
+
+        for chunk in response:
+            if not chunk.choices:
+                continue
+
+            content = chunk.choices[0].delta.content or ""
+            if content:
+                yield content
+
+        elapsed = time.perf_counter() - start_time
+        print(f"\n[DeepSeek] elapsed={elapsed:.2f}s")
+
+    except Exception as exc:
+        print(f"\n[DeepSeek ERROR] {exc}")
+        yield "模型服务暂时不可用，请稍后重试。"
