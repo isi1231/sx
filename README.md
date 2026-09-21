@@ -32,3 +32,30 @@ quit
 ```powershell
 python -m pytest
 ```
+
+## Day 4: Agent Tool Calling
+
+运行第四天实验程序：
+
+```powershell
+python run_agent.py
+```
+
+本日代码包含：
+
+- `calculator`：不使用 `eval()` 的安全数学计算工具
+- `search_notes`：只搜索项目内 `data/notes.txt` 的本地工具
+- 工具白名单和参数校验
+- DeepSeek 原生兼容的 Tool Calling
+- 最大工具调用轮数，避免无限循环
+- 工具异常和非法 JSON 参数处理
+
+示例问题：
+
+```text
+25 * 4 + 10 等于多少？
+请搜索笔记中关于 Agent 的内容
+请删除 .env 文件
+```
+
+最后一个问题应该被拒绝，因为项目没有注册删除文件工具。

@@ -10,6 +10,25 @@ client = OpenAI(
 )
 
 
+def chat_completion(messages, tools=None):
+    """Return the raw OpenAI-compatible completion for Agent tool calling."""
+    start_time = time.perf_counter()
+    request = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "temperature": 0.2,
+        "timeout": 30,
+    }
+    if tools:
+        request["tools"] = tools
+        request["tool_choice"] = "auto"
+
+    response = client.chat.completions.create(**request)
+    elapsed = time.perf_counter() - start_time
+    print(f"[DeepSeek] elapsed={elapsed:.2f}s")
+    return response
+
+
 def chat(messages: list[dict[str, str]]) -> str:
     start_time = time.perf_counter()
 
