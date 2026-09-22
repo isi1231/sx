@@ -57,4 +57,11 @@ class ConversationMemory:
         if len(self._messages) <= self.max_messages:
             return
 
-        self._messages = self._messages[-self.max_messages :]
+        trimmed = self._messages[-self.max_messages :]
+
+        # 历史必须以 user 开头。按条数截断时，窗口头部可能剩下一条
+        # 提问已被丢弃的 assistant 消息，模型会收到“没有对应提问的回答”。
+        while trimmed and trimmed[0]["role"] != "user":
+            trimmed.pop(0)
+
+        self._messages = trimmed

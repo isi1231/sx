@@ -109,3 +109,44 @@ def test_agent_clear_memory():
     agent.clear_memory()
 
     assert agent.get_memory() == []
+
+
+def test_agent_history_always_starts_with_user():
+    """回归测试：窗口溢出后，发给模型的历史首条必须是 user。
+
+    修复前 max_messages=10 从第 6 轮起会变成 assistant 开头，
+    因为 _trim 在加完 user（此时长度为奇数）之后立即按条数截断。
+    """
+    seen = []
+
+    def fake_llm(messages, tools):
+        seen.append([message["role"] for message in messages])
+
+        assert messages[1]["role"] == "user", (
+            f"第 {len(seen)} 轮历史错位: "
+            f"{[message['role'] for message in messages]}"
+        )
+
+        return make_response(SimpleNamespace(content="收到。", tool_calls=None))
+
+    agent = AgentSession(llm_call=fake_llm, max_messages=10)
+
+    # 必须跑到超过窗口容量（10 条 = 5 轮）才能触发裁剪
+    for index in range(20):
+        agent.ask(f"第 {index} 个问题")
+
+    assert len(seen) == 20
+    assert all(roles[1] == "user" for roles in seen)
+
+
+def test_agent_memory_stays_paired_after_many_turns():
+    """回归测试：多轮之后记忆里不能出现孤儿的 assistant 开头。"""
+    def fake_llm(messages, tools):
+        return make_response(SimpleNamespace(content="收到。", tool_calls=None))
+
+    agent = AgentSession(llm_call=fake_llm, max_messages=10)
+
+    for index in range(20):
+        agent.ask(f"第 {index} 个问题")
+        memory = agent.get_memory()
+        assert memory[0]["role"] == "user"
