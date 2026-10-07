@@ -7,9 +7,10 @@ def main() -> None:
         max_tool_rounds=3,
     )
 
-    print("第 5 天多轮记忆 Agent 已启动。")
+    print("第 6 天上下文工程 Agent 已启动。")
     print("输入 clear 清空记忆。")
     print("输入 memory 查看当前记忆。")
+    print("输入 summary 查看旧对话摘要。")
     print("输入 quit 或 exit 退出。")
 
     while True:
@@ -37,6 +38,17 @@ def main() -> None:
                 content = message.get("content", "")
                 print(f"{index}. [{role}] {content}")
 
+            continue
+
+        if user_input.lower() == "summary":
+            summary = agent.get_summary()
+
+            if not summary:
+                print("还没有摘要（对话还没超出记忆容量）。")
+                continue
+
+            print(f"\n已压缩 {agent.compressed_count} 条旧消息，摘要如下：")
+            print(summary)
             continue
 
         if not user_input:
