@@ -1,7 +1,8 @@
 # Agent Demo
 
 每天的学习讲解、流程图和实测证据在 [`../doc/`](../doc/README.md)：
-`day01-02` 多轮对话 · `day03` Prompt 工程 · `day04` 工具调用 · `day05` 记忆机制 · `day06` 上下文工程。
+`day01-02` 多轮对话 · `day03` Prompt 工程 · `day04` 工具调用 · `day05` 记忆机制 ·
+`day06` 上下文工程 · `day07` 可观测性 / trace。
 
 跑测试（**在 `agent_demo/` 目录下**）：
 
@@ -189,7 +190,7 @@ python -m pytest
 | 记忆仍是硬截断 | 被裁掉的对话永久丢失 | ✅ Day 6 已换成摘要压缩 |
 | 请求失败会留下孤儿 `user` 消息 | 写入发生在调用模型之前 | ✅ Day 6 已改成成功后提交 |
 | 上一轮工具结果不可见 | `role="tool"` 不进记忆 | ✅ Day 6 已写入 `[本轮工具调用]` |
-| `max_messages` 语义不清 | 实际只按「条数」保留，`=10` 只有 5 轮 | ⬜ 待改 `max_turns` |
+| `max_messages` 语义不清 | 实际只按「条数」保留，`=10` 只有 5 轮 | ⬜ 待改 `max_turns`（推迟到 D8） |
 | `max_tool_rounds=3` 偏小 | 每轮 = 1 次模型请求，实际只够 2 次工具调用 | ⬜ 待处理 |
 | 观察 | `tool_choice="auto"` 下，模型会对 `1+1` 这类简单算式直接回答而不调用 `calculator` | — |
 
@@ -332,13 +333,126 @@ Day 5 那条错位路径已经不会被经过。所以 `test_agent_history_alway
 
 | # | 问题 | 计划 |
 | --- | --- | --- |
-| 1 | `max_messages` 语义仍是「条数」 | D7 改 `max_turns` |
-| 2 | `_message_to_dict` 三种分支返回的 dict 形状不一致 | D7 |
-| 3 | 摘要本身没有长度硬约束，只靠 prompt 里的「不超过 N 字」 | D7 加代码侧截断 |
+| 1 | `max_messages` 语义仍是「条数」 | D8 改 `max_turns`（D7 推迟） |
+| 2 | `_message_to_dict` 三种分支返回的 dict 形状不一致 | ✅ Day 7 已收口 |
+| 3 | 摘要本身没有长度硬约束，只靠 prompt 里的「不超过 N 字」 | ✅ Day 7 已加代码侧截断 |
 | 4 | `max_tool_rounds=3` 只够 2 次工具调用 | D8 |
 | 5 | `calculator` 会泄漏 `OverflowError` / `ZeroDivisionError` | D8 |
 | 6 | 压缩发生在 `add()` 里，是**同步阻塞**的（一次压缩 = 一次模型请求） | D15 异步化 |
 
 第 6 条是 Day 6 新引入的真实代价：用户提问触发压缩时，这一轮会多出一次模型调用的延迟。
 现在能接受（几分钟一次），但要做成服务就必须异步，否则会拖慢 P99。
+
+## Day 7: Observability / Trace
+
+运行第七天实验程序：
+
+```powershell
+python run_trace.py                    # 聊天，逐事件写入 trace/trace-<时间>.jsonl
+python run_trace.py --replay <file>    # 离线回放一份 trace，不花钱
+```
+
+聊天中可用的命令：
+
+```text
+trace     打印当前 trace 的回放（含这一轮真正发出去的 messages）
+stats     只看 token / 耗时 / 前缀缓存命中率
+memory    查看当前记忆
+clear     清空记忆
+quit      退出
+```
+
+示例：
+
+```text
+25 * 4 + 10 等于多少？
+trace
+stats
+quit
+```
+
+本日代码包含：
+
+- `app/trace.py`：`TraceRecorder`（只管记）+ `json_safe` / `render_replay` / `summarize_usage` / `find_errors`（纯函数，只解释）
+- 一轮对话打 5 个点：`request` / `response` / `tool_call` / `answer` / `error`
+- 每事件一行 jsonl，**每落一个事件就 append 一次** → 进程崩在哪儿，trace 就停在哪儿
+- `emit()` 存**快照**（深拷贝），不会因为 `messages` 后面继续增长而污染早期事件
+- `json_safe()` 三层兜底（`model_dump` → `__dict__` → `str`），保证**记录失败时永不抛异常**
+- `_read_usage()` 抠 token 用量，含 DeepSeek 的 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
+- 离线 `--replay`：一份 trace 可以反复看，不用重跑模型
+- `tracer` 是可选注入的，不传就是 `None`，零开销
+- `trace/` 已进 `.gitignore`
+
+### 两个设计取舍
+
+**1. 每事件一次 open/write，而不是退出时统一 save。**
+
+慢一点，但崩溃时 trace 恰好停在崩溃点 —— 那一条记录最值钱。想验证：跑一轮后直接 `Ctrl+C`，`--replay` 依然读得出来。
+
+**2. `TraceRecorder` 只记不解释。**
+
+统计和渲染都在纯函数里（喂事件列表就出文本），所以回放可以离线跑、可以单测喂造出来的事件，也**不用为了改回放样式而重调模型**。
+
+### 顺带结清 Day 6 的两笔账
+
+- `_message_to_dict` 输出形状收口：`role` / `content` 永远在，`tool_calls` 展开成纯 dict（否则 trace 一落盘 `json.dumps` 就炸）
+- 摘要加上代码侧硬上限：`HARD_LIMIT_FACTOR = 2`，默认 `max_chars × 2`，截断保留头部（`SUMMARY_PROMPT` 要求按重要性排序）
+
+### 验证
+
+```powershell
+python -m pytest                  # 103 passed（Day 6 是 53）
+python run_trace.py               # 交互式亲眼看：问一句后输 trace / stats
+python run_trace.py --replay trace/trace-<时间>.jsonl
+```
+
+回放长这样：
+
+```text
+── 第 1 轮 ──────────────────────────────────────────────
+   1. → 请求  2 条 ['system', 'user']  tools=calculator,search_notes
+   2. ← 响应  0.01ms  tokens 1230  缓存命中 1140  要调 calculator
+   3. ⚙ 工具  calculator({"expression": "25 * 4 + 10"})  0.17ms ok → 110
+   4. → 请求  4 条 ['system', 'user', 'assistant', 'tool']  ...
+   7. → 请求  6 条 ['system', 'user', 'assistant', 'tool', 'assistant', 'tool']  ...
+   9. ✓ 回答  25 * 4 + 10 = 110。笔记里关于 Agent 的部分主要讲工具调用和记忆。  本轮 13.24ms
+
+── 第 2 轮 ──────────────────────────────────────────────
+   2. ✗ 出错  llm_call 阶段 RuntimeError: 模型服务 502
+
+合计：4 次请求 / 5698 tokens / 前缀缓存命中率 96.0% / 出错 1 次
+```
+
+新用例的有效性用 6 组探针验证过（把改动逐条还原成 Day 6 行为，看测试接不接得住；
+一次性实验，未留在仓库）：
+
+| 探针 | 还原成 | 结果 |
+| --- | --- | --- |
+| 1 | `emit` 存活引用，不深拷贝 | ✅ 2 条用例失败 |
+| 2 | `_message_to_dict` 不做形状归一 | ✅ 2 条用例失败 |
+| 3 | `json_safe` 去掉 `model_dump` 层 | ✅ 1 条用例失败 |
+| 4 | 不 emit `tool_call` | ✅ 2 条用例失败 |
+| 5 | 不 emit `error` | ✅ 2 条用例失败 |
+| 6 | 摘要不设硬上限 | ✅ 2 条用例失败 |
+
+（Day 6 的探针 4 是「0 条失败」，今天 6/6 全中 —— 区别是今天每条探针都打在今天新写的代码路径上。）
+
+### 已知问题
+
+| # | 问题 | 计划 |
+| --- | --- | --- |
+| 1 | `max_messages` 语义仍是「条数」 | D8 改 `max_turns` |
+| 2 | `max_tool_rounds=3` 只够 2 次工具调用 | D8 |
+| 3 | `calculator` 会泄漏 `OverflowError` / `ZeroDivisionError` | D8 |
+| 4 | 失败的工具调用**不计入**合计里的「出错 N 次」（`find_errors` 只看 `kind=="error"`） | D8 拆成「异常 / 工具失败」两行 |
+| 5 | **没采集 `reasoning_content`**（计划 D7 里写的 "thought"）—— 现在用的 `deepseek-chat` 没这个字段 | 用上推理模型时补 |
+| 6 | trace 文件无轮转、无上限，长跑会一直涨 | 后续 |
+
+`tests/` 耗时从 0.3 秒涨到 3~5 秒，**不是代码回归**：项目里 5 条用例用了 `tmp_path`，
+而 pytest 在基目录非空时要扫描清理旧的编号目录 —— 本机 `os.rmdir`（删目录）实测约 **250 ms/次**（C:），
+`test_memory.py`（不用 `tmp_path`，21 条）单独跑只要 0.06 秒。详见 `doc/day07.md` 第十二节。
+
+> 想验证：`python -m pytest test/test_trace.py --basetemp=<一个全新空目录>` → 0.14 秒；去掉 `--basetemp` 再跑 → 3.6 秒。
+
+> 这一天同样**没有**新建 `scripts/` —— 理由见 `doc/day06.md` 第十节。
 

@@ -1,19 +1,25 @@
 """A native Python Agent with tools and short-term memory.
 
-Day 6 的主题是「上下文工程」：每轮请求真正发出去的那串 messages 是怎么拼出来的。
+Day 7 的主题是「可观测性」：给每一轮打点，让「模型看到了什么、调了什么、
+哪一步慢、哪一步贵、哪一步错了」都有据可查，而不是靠 print 猜。
 
-和 Day 5 相比，`ask()` 里多了三件事：
-1. 摘要压缩：被裁掉的旧对话不再直接丢弃，而是压成一段摘要常驻上下文
-2. 工具结果入记忆：本轮调过的工具会以 `[本轮工具调用]` 的形式跟着回答进记忆，
-   下一轮模型能直接看到上轮工具的真实返回（Day 4/5 是看不到的）
-3. 写入推迟：记忆只在**成功拿到回答之后**才写，请求失败不留孤儿 user 消息
+`ask()` 一共打五个点（全部通过 `tracer` 可选注入，不传就是零开销）：
+
+    request   → 本轮真正发出去的 messages + 可用工具
+    response  ← 模型返回的 content / tool_calls / 延迟 / token 用量
+    tool_call ⚙ 工具名 / 参数 / 结果 / 耗时 / 是否成功
+    answer    ✓ 最终回答 + 本轮总耗时
+    error     ✗ 异常发生在哪个阶段
 """
 
 import json
+import time
+from pathlib import Path
 from typing import Any, Callable
 
 from app.memory import ConversationMemory, Summarizer
 from app.tools import TOOL_SCHEMAS, execute_tool
+from app.trace import TraceRecorder, millis
 
 
 SYSTEM_PROMPT = """
@@ -70,23 +76,86 @@ def _clip(text: str, limit: int = TOOL_RESULT_LIMIT) -> str:
 
 
 def _message_to_dict(message: Any) -> dict[str, Any]:
-    """Convert an SDK message object to a normal dictionary."""
-    if hasattr(message, "model_dump"):
-        return message.model_dump(exclude_none=True)
+    """把一条消息统一成 JSON 安全的字典。
 
+    Day 6 之前这里是三条各自返回不同形状的分支：
+    走 `model_dump` 时带 `tool_calls` 但可能没有 `content`，
+    走 dict 时原样返回，走兜底时又是另一套键。
+    结果**同一个函数对三种输入给出三种形状** —— 下游代码没法可靠地按键取值。
+
+    现在收口成一条规范：`role` 和 `content` 永远存在，其余键按需附带。
+    """
     if isinstance(message, dict):
-        return message
+        raw: dict[str, Any] = message
+    elif hasattr(message, "model_dump"):
+        raw = message.model_dump(exclude_none=True)
+    else:
+        raw = {
+            "role": getattr(message, "role", "assistant"),
+            "content": getattr(message, "content", None),
+            "tool_calls": getattr(message, "tool_calls", None),
+            "tool_call_id": getattr(message, "tool_call_id", None),
+            "name": getattr(message, "name", None),
+        }
 
-    result: dict[str, Any] = {
-        "role": getattr(message, "role", "assistant"),
-        "content": getattr(message, "content", None),
+    normalized: dict[str, Any] = {
+        "role": raw.get("role", "assistant"),
+        "content": raw.get("content"),
     }
 
-    tool_calls = getattr(message, "tool_calls", None)
+    tool_calls = raw.get("tool_calls")
     if tool_calls:
-        result["tool_calls"] = tool_calls
+        # 展开成纯 dict：SDK 的 tool_call 是对象，直接塞进 messages 后面
+        # json.dumps 会失败（trace 一落盘就暴露）
+        normalized["tool_calls"] = [
+            {
+                "id": _get_tool_call_id(tool_call),
+                "type": "function",
+                "function": {
+                    "name": _get_tool_call_value(tool_call, "name") or "",
+                    "arguments": _get_tool_call_value(tool_call, "arguments") or "{}",
+                },
+            }
+            for tool_call in tool_calls
+        ]
 
-    return result
+    for key in ("tool_call_id", "name"):
+        value = raw.get(key)
+        if value is not None:
+            normalized[key] = value
+
+    return normalized
+
+
+USAGE_FIELDS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    # DeepSeek 独有：前缀缓存命中/未命中的 prompt token 数（见 Day 6 的缓存讨论）
+    "prompt_cache_hit_tokens",
+    "prompt_cache_miss_tokens",
+)
+
+
+def _read_usage(response: Any) -> dict[str, int]:
+    """从 SDK 响应里抠出 token 用量；抠不到就返回空 dict，绝不抛异常。
+
+    `prompt_cache_hit_tokens` 不在 OpenAI SDK 的声明字段里，
+    它落在 pydantic 的 `model_extra` 里，所以优先走 `model_dump()`。
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {}
+
+    if hasattr(usage, "model_dump"):
+        raw = usage.model_dump(exclude_none=True)
+    elif isinstance(usage, dict):
+        raw = usage
+    else:
+        raw = {field: getattr(usage, field, None) for field in USAGE_FIELDS}
+
+    # 只留计数器：`*_details` 之类的嵌套结构对统计没用
+    return {key: value for key, value in raw.items() if isinstance(value, int)}
 
 
 def _get_tool_call_value(tool_call: Any, key: str) -> Any:
@@ -119,6 +188,7 @@ class AgentSession:
         max_tool_rounds: int = 3,
         keep_recent: int | None = None,
         summarizer: Summarizer | None = None,
+        tracer: TraceRecorder | None = None,
     ) -> None:
         self.llm_call = llm_call
         self.memory = ConversationMemory(
@@ -127,6 +197,7 @@ class AgentSession:
             summarizer=summarizer,
         )
         self.max_tool_rounds = max_tool_rounds
+        self.tracer = tracer
 
     # ---------- 记忆的操作 ----------
 
@@ -157,23 +228,74 @@ class AgentSession:
             f"<untrusted_user_input>\n{user_input}\n</untrusted_user_input>"
         )
 
+        if self.tracer is not None:
+            self.tracer.start_turn()
+
+        turn_started = time.perf_counter()
         messages = self._build_messages(wrapped_input)
         tool_log: list[str] = []
+        tool_call_count = 0
 
         for _ in range(self.max_tool_rounds):
-            response = self.llm_call(messages, TOOL_SCHEMAS)
+            if self.tracer is not None:
+                # messages 是个活列表，会随着工具调用继续变长；
+                # emit 内部做深拷贝，所以这里存下来的是**本次请求的快照**
+                self.tracer.emit(
+                    "request",
+                    model_messages=messages,
+                    tools=[schema["function"]["name"] for schema in TOOL_SCHEMAS],
+                )
+
+            request_started = time.perf_counter()
+
+            try:
+                response = self.llm_call(messages, TOOL_SCHEMAS)
+            except Exception as exc:
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "error",
+                        phase="llm_call",
+                        type=type(exc).__name__,
+                        message=str(exc),
+                        latency_ms=millis(request_started),
+                    )
+                raise  # 不吞异常：怎么处理由调用方决定
+
+            latency_ms = millis(request_started)
             assistant_message = response.choices[0].message
             tool_calls = getattr(assistant_message, "tool_calls", None)
+            answer_text = getattr(assistant_message, "content", None)
+
+            if self.tracer is not None:
+                self.tracer.emit(
+                    "response",
+                    content=answer_text,
+                    tool_calls=[
+                        {
+                            "name": _get_tool_call_value(tool_call, "name") or "",
+                            "arguments": _get_tool_call_value(tool_call, "arguments") or "{}",
+                        }
+                        for tool_call in (tool_calls or [])
+                    ],
+                    latency_ms=latency_ms,
+                    usage=_read_usage(response),
+                )
 
             if not tool_calls:
-                answer = (
-                    getattr(assistant_message, "content", None)
-                    or "模型没有返回有效文本。"
-                )
+                answer = answer_text or "模型没有返回有效文本。"
 
                 # 写入推迟到这里：只有真的拿到回答才落记忆。
                 # 中途抛异常时记忆保持原样，不会留下一条没有回答的 user 消息。
                 self._commit(wrapped_input, answer, tool_log)
+
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "answer",
+                        content=answer,
+                        tool_calls=tool_call_count,
+                        turn_latency_ms=millis(turn_started),
+                    )
+
                 return answer
 
             messages.append(_message_to_dict(assistant_message))
@@ -182,12 +304,33 @@ class AgentSession:
                 tool_name = _get_tool_call_value(tool_call, "name") or ""
                 raw_arguments = _get_tool_call_value(tool_call, "arguments") or "{}"
 
+                tool_started = time.perf_counter()
+                tool_error: str | None = None
+
                 try:
                     arguments = json.loads(raw_arguments)
                 except (TypeError, json.JSONDecodeError):
                     tool_result = "工具拒绝执行：参数不是合法 JSON"
+                    tool_error = "bad_json"
                 else:
-                    tool_result = execute_tool(tool_name, arguments)
+                    try:
+                        tool_result = execute_tool(tool_name, arguments)
+                    except Exception as exc:  # execute_tool 契约上不抛，兜一层
+                        tool_result = f"工具执行失败：{exc}"
+                        tool_error = type(exc).__name__
+
+                tool_call_count += 1
+
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "tool_call",
+                        name=tool_name,
+                        arguments=raw_arguments,
+                        result=tool_result,
+                        ok=tool_error is None,
+                        error=tool_error,
+                        latency_ms=millis(tool_started),
+                    )
 
                 if len(tool_log) < MAX_TOOL_LOG_ENTRIES:
                     tool_log.append(
@@ -205,6 +348,16 @@ class AgentSession:
 
         timeout_answer = "工具调用次数超过限制，任务已停止。"
         self._commit(wrapped_input, timeout_answer, tool_log)
+
+        if self.tracer is not None:
+            self.tracer.emit(
+                "answer",
+                content=timeout_answer,
+                tool_calls=tool_call_count,
+                turn_latency_ms=millis(turn_started),
+                stopped_by="max_tool_rounds",
+            )
+
         return timeout_answer
 
     # ---------- 上下文组装 ----------
@@ -287,16 +440,20 @@ def create_real_agent(
     max_tool_rounds: int = 3,
     keep_recent: int | None = None,
     summarize: bool = True,
+    trace_path: str | Path | None = None,
 ) -> AgentSession:
     """Create an AgentSession connected to the real DeepSeek client.
 
-    `summarize=False` 可以退回 Day 5 的纯滑窗行为，方便做对照实验。
+    - `summarize=False` 退回 Day 5 的纯滑窗行为，方便做对照实验
+    - `trace_path` 给定时开启 trace，**逐事件 append** 到该 jsonl；
+      不给就是零开销，连 `TraceRecorder` 都不创建
     """
     from app.llm_client import chat_completion
 
     from app.summarizer import build_summarizer
 
     summarizer = build_summarizer(chat_completion) if summarize else None
+    tracer = TraceRecorder(path=trace_path) if trace_path is not None else None
 
     return AgentSession(
         llm_call=chat_completion,
@@ -304,4 +461,5 @@ def create_real_agent(
         max_tool_rounds=max_tool_rounds,
         keep_recent=keep_recent,
         summarizer=summarizer,
+        tracer=tracer,
     )

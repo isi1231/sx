@@ -10,6 +10,14 @@
 from typing import Any, Callable
 
 
+# 提示词里说了「不超过 max_chars 字」，但**那是软约束** —— 模型不保证遵守。
+# 代码里再兜一道硬上限，防止「摘要」反而把上下文撑大。
+# 留 2 倍余量：既给模型正常发挥的空间，又兜住失控的情况。
+HARD_LIMIT_FACTOR = 2
+
+TRUNCATED_MARK = "…（摘要已截断）"
+
+
 SUMMARY_PROMPT = """你在维护一段多轮对话的长期记忆。
 
 下面有「已有摘要」和「新增对话」两部分。请把两者合并成一段不超过 {max_chars} 字的摘要。
@@ -39,15 +47,33 @@ SUMMARY_PROMPT = """你在维护一段多轮对话的长期记忆。
 """
 
 
+def enforce_limit(text: str, limit: int) -> str:
+    """超长就砍掉尾巴。
+
+    砍尾巴是有讲究的：`SUMMARY_PROMPT` 要求模型**按重要性排序**输出
+    （用户身份 → 目标 → 已确认事实 → 未解决问题），
+    所以被砍掉的恰好是最不重要的那部分。
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+
+    return text[:limit] + TRUNCATED_MARK
+
+
 def build_summarizer(
     llm_call: Callable[[list[dict[str, Any]], list[dict[str, Any]]], Any],
     max_chars: int = 400,
+    hard_limit: int | None = None,
 ) -> Callable[[str, str], str]:
     """返回一个 (旧摘要, 新增对话) -> 新摘要 的函数。
 
     传入的 llm_call 与 Agent 用的是同一个签名 `(messages, tools)`，
     这样测试里可以直接复用同一个假模型。
+
+    `hard_limit` 不给时按 `max_chars * HARD_LIMIT_FACTOR` 兜底。
     """
+    if hard_limit is None:
+        hard_limit = max_chars * HARD_LIMIT_FACTOR
 
     def summarize(old_summary: str, new_text: str) -> str:
         prompt = SUMMARY_PROMPT.format(
@@ -59,6 +85,6 @@ def build_summarizer(
         response = llm_call([{"role": "user", "content": prompt}], [])
         content = getattr(response.choices[0].message, "content", None) or ""
 
-        return content.strip()
+        return enforce_limit(content.strip(), hard_limit)
 
     return summarize
