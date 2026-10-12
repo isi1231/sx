@@ -4,7 +4,10 @@ from types import SimpleNamespace
 import pytest
 
 from app.agent import (
+    BUDGET_ANSWER,
+    DEFAULT_MAX_MODEL_CALLS,
     MAX_TOOL_LOG_ENTRIES,
+    NO_PROGRESS_LIMIT,
     TOOL_RESULT_LIMIT,
     AgentSession,
     _clip,
@@ -12,6 +15,7 @@ from app.agent import (
     _read_usage,
     run_agent,
 )
+from app.tools import ToolResult
 from app.trace import TraceRecorder, load_events, render_replay
 
 
@@ -60,11 +64,17 @@ def test_agent_calls_tool_then_returns_final_answer():
     assert calls[1][-1]["content"] == "5"
 
 
-def test_agent_stops_at_max_rounds():
-    def fake_llm(messages, tools):
-        return tool_round(make_tool_call("calculator", '{"expression":"1 + 1"}'))
+def test_agent_stops_when_model_call_budget_runs_out():
+    """预算用尽的中断：每轮都换了参数（有进展），但永远收不了尾。"""
+    counter = {"n": 0}
 
-    assert "超过限制" in run_agent("循环调用", llm_call=fake_llm, max_rounds=2)
+    def fake_llm(messages, tools):
+        counter["n"] += 1
+        return tool_round(
+            make_tool_call("calculator", f'{{"expression":"1 + {counter["n"]}"}}')
+        )
+
+    assert "超过限制" in run_agent("循环调用", llm_call=fake_llm, max_model_calls=2)
 
 
 def test_agent_rejects_broken_tool_arguments():
@@ -239,7 +249,7 @@ def test_agent_tool_log_enters_memory_and_reaches_next_turn():
 
 def test_agent_clips_long_tool_result_in_memory(monkeypatch):
     long_text = "很长的工具结果。" * 100
-    monkeypatch.setattr("app.agent.execute_tool", lambda name, arguments: long_text)
+    monkeypatch.setattr("app.agent.execute_tool", lambda name, arguments: ToolResult(long_text))
 
     calls = []
 
@@ -603,18 +613,26 @@ def test_agent_trace_records_error_then_leaves_memory_clean():
     assert agent.get_memory() == []
 
 
-def test_agent_trace_marks_timeout_reason():
+def test_agent_trace_marks_budget_stop():
+    """每轮换参数（有进展），所以是「话多」被预算拦下，不是「打转」。"""
+    counter = {"n": 0}
+
     def fake_llm(messages, tools):
-        return tool_round(make_tool_call("calculator", '{"expression":"1 + 1"}'))
+        counter["n"] += 1
+        return tool_round(
+            make_tool_call("calculator", f'{{"expression":"1 + {counter["n"]}"}}')
+        )
 
     tracer = TraceRecorder()
-    agent = AgentSession(llm_call=fake_llm, max_messages=10, max_tool_rounds=2, tracer=tracer)
+    agent = AgentSession(
+        llm_call=fake_llm, max_messages=10, max_model_calls=2, tracer=tracer
+    )
     agent.ask("一直算")
 
     answer_event = tracer.events[-1]
 
     assert answer_event["kind"] == "answer"
-    assert answer_event["payload"]["stopped_by"] == "max_tool_rounds"
+    assert answer_event["payload"]["stopped_by"] == "max_model_calls"
 
 
 def test_agent_trace_numbers_turns():
@@ -679,8 +697,289 @@ def test_trace_round_trips_through_disk_and_replays(tmp_path):
     report = render_replay(events, show_messages=True)
 
     assert "第 1 轮" in report and "第 2 轮" in report
-    assert "出错      1 次" in report
+    assert "异常      1 次" in report
     assert "第 1 轮 llm_call：RuntimeError 第一次就挂" in report
     assert "25 * 4 + 10" in report
     assert "计算结果是 110。" in report
     assert "[system]" in report, "show_messages 要把真正发出去的上下文打出来"
+
+
+# ============ Day 8：轮次预算 ============
+
+
+def test_default_budget_allows_five_tool_calls():
+    """旧默认 max_tool_rounds=3 只够 2 次工具调用；新默认 6 次请求 = 5 次调用 + 1 次回答。"""
+    assert DEFAULT_MAX_MODEL_CALLS == 6
+
+    counter = {"n": 0}
+
+    def fake_llm(messages, tools):
+        counter["n"] += 1
+        if counter["n"] <= 5:
+            return tool_round(
+                make_tool_call("calculator", f'{{"expression":"{counter["n"]} + 1"}}')
+            )
+        return answer("收尾了。")
+
+    agent = AgentSession(llm_call=fake_llm, max_turns=5)
+    result = agent.ask("五步任务")
+
+    assert result == "收尾了。", "需要 5 次工具调用的任务必须能跑完"
+    assert counter["n"] == 6
+
+
+def test_agent_rejects_bad_budgets():
+    with pytest.raises(ValueError):
+        AgentSession(llm_call=lambda messages, tools: answer("x"), max_model_calls=0)
+
+    with pytest.raises(ValueError):
+        AgentSession(llm_call=lambda messages, tools: answer("x"), max_retries=-1)
+
+
+def test_budget_stop_still_writes_memory_and_trace():
+    """中断也是正常收尾：记忆要落盘，trace 要能看出是哪种中断。"""
+    counter = {"n": 0}
+
+    def fake_llm(messages, tools):
+        counter["n"] += 1
+        return tool_round(
+            make_tool_call("calculator", f'{{"expression":"{counter["n"]} + 1"}}')
+        )
+
+    tracer = TraceRecorder()
+    agent = AgentSession(llm_call=fake_llm, max_model_calls=2, tracer=tracer)
+
+    assert agent.ask("算不完的题") == BUDGET_ANSWER
+
+    memory = agent.get_memory()
+    assert [message["role"] for message in memory] == ["user", "assistant"]
+    assert BUDGET_ANSWER in memory[1]["content"]
+    assert tracer.events[-1]["payload"]["stopped_by"] == "max_model_calls"
+
+
+# ============ Day 8：无进展检测 ============
+
+
+def test_no_progress_stops_a_repeating_loop():
+    """连续两轮同工具同参数 = 原地打转，第 2 次不再执行，直接中断。"""
+    calls = []
+
+    def fake_llm(messages, tools):
+        calls.append(messages)
+        return tool_round(make_tool_call("calculator", '{"expression":"1 + 1"}'))
+
+    tracer = TraceRecorder()
+    agent = AgentSession(llm_call=fake_llm, max_turns=5, tracer=tracer)
+
+    result = agent.ask("一直算 1+1")
+
+    assert "检测到连续重复的工具调用" in result
+    assert "calculator" in result
+
+    # 第 1 次正常执行，第 2 次被拦下 —— 所以只请求了 2 次模型、只执行了 1 次工具
+    assert len(calls) == NO_PROGRESS_LIMIT
+    assert len([e for e in tracer.events if e["kind"] == "tool_call"]) == 1
+
+
+def test_no_progress_is_not_fooled_by_changing_arguments():
+    """对照组：同样的工具、**不同的参数**是正常进展，不该被拦。"""
+    counter = {"n": 0}
+
+    def fake_llm(messages, tools):
+        counter["n"] += 1
+        if counter["n"] <= 3:
+            return tool_round(
+                make_tool_call("calculator", f'{{"expression":"{counter["n"]} + 1"}}')
+            )
+        return answer("三次都算完了。")
+
+    agent = AgentSession(llm_call=fake_llm, max_turns=5)
+
+    assert agent.ask("分三次算") == "三次都算完了。"
+    assert counter["n"] == 4
+
+
+def test_no_progress_ignores_identical_calls_inside_one_batch():
+    """一批里的多个相同调用不是「连续两轮」—— 那是模型一次要算两遍同一个式子。"""
+    counter = {"n": 0}
+
+    def fake_llm(messages, tools):
+        counter["n"] += 1
+        if counter["n"] == 1:
+            return tool_round(
+                make_tool_call("calculator", '{"expression":"1 + 1"}', call_id="a"),
+                make_tool_call("calculator", '{"expression":"1 + 1"}', call_id="b"),
+            )
+        return answer("两个都是 2。")
+
+    agent = AgentSession(llm_call=fake_llm, max_turns=5)
+
+    assert agent.ask("算两遍 1+1") == "两个都是 2。"
+
+
+def test_no_progress_records_the_repeated_arguments_in_trace():
+    counter = {"n": 0}
+
+    def fake_llm(messages, tools):
+        counter["n"] += 1
+        return tool_round(make_tool_call("calculator", '{"expression":"7 * 7"}'))
+
+    tracer = TraceRecorder()
+    agent = AgentSession(llm_call=fake_llm, max_turns=5, tracer=tracer)
+    agent.ask("循环")
+
+    answer_event = tracer.events[-1]
+
+    assert answer_event["payload"]["stopped_by"] == "no_progress"
+    assert answer_event["payload"]["repeated"] == '{"expression":"7 * 7"}'
+
+
+def test_no_progress_still_writes_memory():
+    def fake_llm(messages, tools):
+        return tool_round(make_tool_call("calculator", '{"expression":"1 + 1"}'))
+
+    agent = AgentSession(llm_call=fake_llm, max_turns=5)
+    agent.ask("循环")
+
+    memory = agent.get_memory()
+
+    assert [message["role"] for message in memory] == ["user", "assistant"]
+    assert "检测到连续重复的工具调用" in memory[1]["content"]
+
+
+# ============ Day 8：失败重试 ============
+
+
+def test_retry_recovers_from_a_transient_failure():
+    state = {"n": 0}
+
+    def flaky(messages, tools):
+        state["n"] += 1
+        if state["n"] <= 2:
+            raise RuntimeError(f"第 {state['n']} 次抖动")
+        return answer("第三次终于成功。")
+
+    slept = []
+    agent = AgentSession(
+        llm_call=flaky, max_turns=5, max_retries=2, sleep=slept.append
+    )
+
+    assert agent.ask("问一下") == "第三次终于成功。"
+    assert state["n"] == 3
+    # 指数退避：0.5s → 1s（不是固定间隔，也不是线性）
+    assert slept == [0.5, 1.0]
+
+
+def test_retry_raises_the_last_exception_when_exhausted():
+    def boom(messages, tools):
+        raise RuntimeError("一直挂")
+
+    tracer = TraceRecorder()
+    slept = []
+    agent = AgentSession(
+        llm_call=boom, max_turns=5, max_retries=2, tracer=tracer, sleep=slept.append
+    )
+
+    with pytest.raises(RuntimeError, match="一直挂"):
+        agent.ask("问一下")
+
+    # 记忆仍然干净（Day 6 的不变量在重试路径上同样成立）
+    assert agent.get_memory() == []
+
+    errors = [event for event in tracer.events if event["kind"] == "error"]
+
+    assert len(errors) == 3, "1 次原始尝试 + 2 次重试"
+    assert [event["payload"]["attempt"] for event in errors] == [1, 2, 3]
+    assert [event["payload"]["will_retry"] for event in errors] == [True, True, False]
+    assert all(event["payload"]["max_attempts"] == 3 for event in errors)
+    assert slept == [0.5, 1.0]
+
+
+def test_retry_is_off_by_default_in_the_pure_layer():
+    """默认不重试：纯逻辑层要确定性，重试是编排层的策略。"""
+    state = {"n": 0}
+
+    def boom(messages, tools):
+        state["n"] += 1
+        raise RuntimeError("挂")
+
+    agent = AgentSession(llm_call=boom, max_turns=5)
+
+    with pytest.raises(RuntimeError):
+        agent.ask("问一下")
+
+    assert state["n"] == 1
+
+
+def test_agent_sends_tool_rejection_back_to_the_model():
+    """端到端：calculator 拒绝的表达式变成一句话进上下文，模型据此自己纠正。"""
+    seen = []
+
+    def fake_llm(messages, tools):
+        seen.append(messages)
+        if len(seen) == 1:
+            return tool_round(make_tool_call("calculator", '{"expression":"1/0"}'))
+        return answer("0 不能做除数。")
+
+    agent = AgentSession(llm_call=fake_llm, max_turns=5)
+
+    assert agent.ask("1 除以 0 等于多少") == "0 不能做除数。"
+
+    tool_messages = [m for m in seen[1] if m["role"] == "tool"]
+    assert tool_messages[0]["content"] == "工具拒绝执行：除数不能为 0"
+
+
+def test_agent_marks_a_rejected_tool_as_failed_in_trace():
+    """回归测试（Day 8 实测发现）：被拒绝的工具**必须**标成 ok=False。
+
+    根因是把布尔信息编码进了文本：`execute_tool` 契约上不抛异常，
+    于是「工具被拒绝」看起来和「工具成功」一模一样 ——
+    trace 里写着 ok，合计里「工具失败 0 次」，全错。
+    """
+    counter = {"n": 0}
+
+    def fake_llm(messages, tools):
+        counter["n"] += 1
+        if counter["n"] == 1:
+            return tool_round(make_tool_call("calculator", '{"expression":"1/0"}'))
+        return answer("算不了。")
+
+    tracer = TraceRecorder()
+    agent = AgentSession(llm_call=fake_llm, max_turns=5, tracer=tracer)
+    agent.ask("1/0")
+
+    tool_event = next(event for event in tracer.events if event["kind"] == "tool_call")
+
+    assert tool_event["payload"]["ok"] is False
+    assert tool_event["payload"]["error"] == "rejected"
+    assert tool_event["payload"]["result"] == "工具拒绝执行：除数不能为 0"
+
+    # 而且它**不是**异常 —— Agent 流程完好无损
+    assert [event["kind"] for event in tracer.events if event["kind"] == "error"] == []
+    assert render_replay(tracer.events).count("工具失败  1 次") == 1
+
+
+def test_retry_never_replays_the_whole_turn(monkeypatch):
+    """重试只包住**单次请求**。包住整轮的话，已经执行过的工具会被再执行一遍。"""
+    executed = []
+
+    def spy(name, arguments):
+        executed.append(name)
+        return ToolResult("4")
+
+    monkeypatch.setattr("app.agent.execute_tool", spy)
+
+    counter = {"n": 0}
+
+    def fake_llm(messages, tools):
+        counter["n"] += 1
+        if counter["n"] == 1:
+            return tool_round(make_tool_call("calculator", '{"expression":"2 + 2"}'))
+        return answer("是 4。")
+
+    agent = AgentSession(llm_call=fake_llm, max_turns=5, max_retries=3)
+
+    assert agent.ask("2+2") == "是 4。"
+
+    assert executed == ["calculator"], "工具只该执行一次，不该因为重试机制被重放"
+    assert counter["n"] == 2, "成功路径不该触发重试"

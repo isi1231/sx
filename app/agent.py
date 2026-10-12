@@ -1,15 +1,19 @@
 """A native Python Agent with tools and short-term memory.
 
-Day 7 的主题是「可观测性」：给每一轮打点，让「模型看到了什么、调了什么、
-哪一步慢、哪一步贵、哪一步错了」都有据可查，而不是靠 print 猜。
+Day 7 加了可观测性：一轮打五个点（`request` / `response` / `tool_call` /
+`answer` / `error`），全部通过 `tracer` 可选注入，不传就是零开销。
 
-`ask()` 一共打五个点（全部通过 `tracer` 可选注入，不传就是零开销）：
+Day 8 的主题是「多步收敛」—— 让一个需要多步的任务**跑得完**，同时**跑不死**。
+三件事，都是为了同一个目的：
 
-    request   → 本轮真正发出去的 messages + 可用工具
-    response  ← 模型返回的 content / tool_calls / 延迟 / token 用量
-    tool_call ⚙ 工具名 / 参数 / 结果 / 耗时 / 是否成功
-    answer    ✓ 最终回答 + 本轮总耗时
-    error     ✗ 异常发生在哪个阶段
+1. **轮次预算**：一次 `ask()` 最多请求模型 `max_model_calls` 次。
+   记忆容量改用「轮」表达（`max_turns`），参数名不再骗人。
+2. **无进展检测**：连续两轮调**同一个工具、同一份参数**，说明模型在原地打转，
+   立即中断 —— 光有数量预算挡不住「3 次一模一样的调用」。
+3. **失败重试**：模型请求失败按指数退避重试，把偶发抖动和真故障区分开。
+
+三者互不替代：
+    轮次预算挡「话多」；无进展检测挡「打转」；重试挡「抖动」。
 """
 
 import json
@@ -17,8 +21,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from app.memory import ConversationMemory, Summarizer
-from app.tools import TOOL_SCHEMAS, execute_tool
+from app.memory import (
+    DEFAULT_MAX_TURNS,
+    ConversationMemory,
+    Summarizer,
+)
+from app.tools import TOOL_SCHEMAS, ToolResult, execute_tool
 from app.trace import TraceRecorder, millis
 
 
@@ -64,6 +72,29 @@ TOOL_RESULT_LIMIT = 200
 # 一轮里最多记录几条工具调用。超出的只留在本次请求里，不进记忆。
 MAX_TOOL_LOG_ENTRIES = 5
 
+# 一次 ask() 最多请求模型几次。
+# 6 次 = 最多 5 次工具调用 + 1 次最终回答 —— 刚好够「需要 3 步以上的任务」。
+# 旧值 3（叫 max_tool_rounds）实际只够 2 次工具调用，名字和语义对不上。
+DEFAULT_MAX_MODEL_CALLS = 6
+
+# 连续几批**完全一样**的工具调用算「原地打转」。
+# 2 = 第 1 次正常执行，第 2 次同样的调用直接中断，不再浪费一次工具执行。
+NO_PROGRESS_LIMIT = 2
+
+# 重试次数。默认 0 是刻意的：纯逻辑层要确定性，重试是编排层的策略。
+# 真实装配（create_real_agent）默认 2。
+DEFAULT_MAX_RETRIES = 0
+
+# 指数退避基数：第 1 次失败后等 0.5s，第 2 次等 1s，第 3 次等 2s……
+DEFAULT_RETRY_BASE_DELAY = 0.5
+
+NO_PROGRESS_ANSWER = (
+    "检测到连续重复的工具调用（{name} 参数完全相同），"
+    "判断为无法推进，任务已停止。"
+)
+
+BUDGET_ANSWER = "工具调用次数超过限制，任务已停止。"
+
 
 def _clip(text: str, limit: int = TOOL_RESULT_LIMIT) -> str:
     """把工具结果压成一行短文本，避免撑爆上下文。"""
@@ -73,6 +104,28 @@ def _clip(text: str, limit: int = TOOL_RESULT_LIMIT) -> str:
         return flat
 
     return f"{flat[:limit]}…（已截断，原文 {len(flat)} 字）"
+
+
+def _run_tool(name: str, raw_arguments: str) -> ToolResult:
+    """解析参数并执行工具，**只返回结构化的成败**，不靠字符串猜。
+
+    三种失败都会变成 `ToolResult(ok=False)`：
+
+    | 失败 | `reason` |
+    | --- | --- |
+    | 参数不是合法 JSON | `bad_json` |
+    | 未知工具 / 参数名不匹配 / 表达式被拒 | `unknown_tool` / `bad_arguments` / `rejected` |
+    | 工具内部意外炸了 | `crashed` 或异常类名 |
+    """
+    try:
+        arguments = json.loads(raw_arguments)
+    except (TypeError, json.JSONDecodeError):
+        return ToolResult("工具拒绝执行：参数不是合法 JSON", False, "bad_json")
+
+    try:
+        return execute_tool(name, arguments)
+    except Exception as exc:  # execute_tool 契约上不抛，兜一层
+        return ToolResult(f"工具执行失败：{exc}", False, type(exc).__name__)
 
 
 def _message_to_dict(message: Any) -> dict[str, Any]:
@@ -179,25 +232,50 @@ def _get_tool_call_id(tool_call: Any) -> str:
 
 
 class AgentSession:
-    """A multi-turn Agent session with bounded short-term memory."""
+    """A multi-turn Agent session with bounded short-term memory.
+
+    三个预算分别管三件事，别混：
+
+    | 参数 | 管什么 | 单位 |
+    | --- | --- | --- |
+    | `max_turns` | 记忆窗口能装多少轮历史 | 轮（= 2 条消息） |
+    | `max_model_calls` | 一次 `ask()` 最多请求模型几次 | 次 |
+    | `max_retries` | 单次请求失败后最多重试几次 | 次 |
+    """
 
     def __init__(
         self,
         llm_call: LLMCall,
-        max_messages: int = 10,
-        max_tool_rounds: int = 3,
+        max_messages: int | None = None,
+        max_turns: int | None = None,
         keep_recent: int | None = None,
+        keep_recent_turns: int | None = None,
+        max_model_calls: int = DEFAULT_MAX_MODEL_CALLS,
         summarizer: Summarizer | None = None,
         tracer: TraceRecorder | None = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
+        if max_model_calls < 1:
+            raise ValueError("max_model_calls 必须至少为 1")
+        if max_retries < 0:
+            raise ValueError("max_retries 不能为负")
+
         self.llm_call = llm_call
         self.memory = ConversationMemory(
+            max_turns=max_turns,
             max_messages=max_messages,
             keep_recent=keep_recent,
+            keep_recent_turns=keep_recent_turns,
             summarizer=summarizer,
         )
-        self.max_tool_rounds = max_tool_rounds
+        self.max_model_calls = max_model_calls
         self.tracer = tracer
+        self.max_retries = max_retries
+        self.retry_base_delay = retry_base_delay
+        # sleep 可注入：测试要验证退避序列，但不能真的等 3.5 秒
+        self._sleep = sleep or time.sleep
 
     # ---------- 记忆的操作 ----------
 
@@ -236,7 +314,11 @@ class AgentSession:
         tool_log: list[str] = []
         tool_call_count = 0
 
-        for _ in range(self.max_tool_rounds):
+        # 无进展检测的状态：上一次那批工具调用的签名，以及它连续出现了几次
+        last_signature: tuple | None = None
+        repeat_count = 0
+
+        for _ in range(self.max_model_calls):
             if self.tracer is not None:
                 # messages 是个活列表，会随着工具调用继续变长；
                 # emit 内部做深拷贝，所以这里存下来的是**本次请求的快照**
@@ -246,22 +328,8 @@ class AgentSession:
                     tools=[schema["function"]["name"] for schema in TOOL_SCHEMAS],
                 )
 
-            request_started = time.perf_counter()
+            response, latency_ms = self._call_llm(messages)
 
-            try:
-                response = self.llm_call(messages, TOOL_SCHEMAS)
-            except Exception as exc:
-                if self.tracer is not None:
-                    self.tracer.emit(
-                        "error",
-                        phase="llm_call",
-                        type=type(exc).__name__,
-                        message=str(exc),
-                        latency_ms=millis(request_started),
-                    )
-                raise  # 不吞异常：怎么处理由调用方决定
-
-            latency_ms = millis(request_started)
             assistant_message = response.choices[0].message
             tool_calls = getattr(assistant_message, "tool_calls", None)
             answer_text = getattr(assistant_message, "content", None)
@@ -298,6 +366,27 @@ class AgentSession:
 
                 return answer
 
+            signature = tuple(
+                (
+                    _get_tool_call_value(tool_call, "name") or "",
+                    _get_tool_call_value(tool_call, "arguments") or "{}",
+                )
+                for tool_call in tool_calls
+            )
+            repeat_count = repeat_count + 1 if signature == last_signature else 1
+            last_signature = signature
+
+            if repeat_count >= NO_PROGRESS_LIMIT:
+                return self._stop(
+                    wrapped_input=wrapped_input,
+                    answer=NO_PROGRESS_ANSWER.format(name=signature[0][0]),
+                    tool_log=tool_log,
+                    tool_call_count=tool_call_count,
+                    turn_started=turn_started,
+                    stopped_by="no_progress",
+                    repeated=signature[0][1],
+                )
+
             messages.append(_message_to_dict(assistant_message))
 
             for tool_call in tool_calls:
@@ -305,20 +394,7 @@ class AgentSession:
                 raw_arguments = _get_tool_call_value(tool_call, "arguments") or "{}"
 
                 tool_started = time.perf_counter()
-                tool_error: str | None = None
-
-                try:
-                    arguments = json.loads(raw_arguments)
-                except (TypeError, json.JSONDecodeError):
-                    tool_result = "工具拒绝执行：参数不是合法 JSON"
-                    tool_error = "bad_json"
-                else:
-                    try:
-                        tool_result = execute_tool(tool_name, arguments)
-                    except Exception as exc:  # execute_tool 契约上不抛，兜一层
-                        tool_result = f"工具执行失败：{exc}"
-                        tool_error = type(exc).__name__
-
+                outcome = _run_tool(tool_name, raw_arguments)
                 tool_call_count += 1
 
                 if self.tracer is not None:
@@ -326,15 +402,16 @@ class AgentSession:
                         "tool_call",
                         name=tool_name,
                         arguments=raw_arguments,
-                        result=tool_result,
-                        ok=tool_error is None,
-                        error=tool_error,
+                        result=outcome.text,
+                        # ok / reason 来自 ToolResult —— **不能**靠文本前缀猜
+                        ok=outcome.ok,
+                        error=outcome.reason,
                         latency_ms=millis(tool_started),
                     )
 
                 if len(tool_log) < MAX_TOOL_LOG_ENTRIES:
                     tool_log.append(
-                        f"- {tool_name}({raw_arguments}) -> {_clip(tool_result)}"
+                        f"- {tool_name}({raw_arguments}) -> {_clip(outcome.text)}"
                     )
 
                 messages.append(
@@ -342,23 +419,84 @@ class AgentSession:
                         "role": "tool",
                         "tool_call_id": _get_tool_call_id(tool_call),
                         "name": tool_name,
-                        "content": tool_result,
+                        "content": outcome.text,
                     }
                 )
 
-        timeout_answer = "工具调用次数超过限制，任务已停止。"
-        self._commit(wrapped_input, timeout_answer, tool_log)
+        return self._stop(
+            wrapped_input=wrapped_input,
+            answer=BUDGET_ANSWER,
+            tool_log=tool_log,
+            tool_call_count=tool_call_count,
+            turn_started=turn_started,
+            stopped_by="max_model_calls",
+        )
+
+    # ---------- 模型调用（含重试） ----------
+
+    def _call_llm(self, messages: list[dict[str, Any]]) -> tuple[Any, float]:
+        """请求模型；失败按指数退避重试。返回 (响应, 成功那次的耗时毫秒)。
+
+        全部尝试都失败时，**抛出最后一次的异常** —— 和 Day 7 一致：
+        观测失败，不处理失败。「失败了该怎么办」由调用方决定。
+        """
+        attempt = 0
+
+        while True:
+            attempt += 1
+            started = time.perf_counter()
+
+            try:
+                response = self.llm_call(messages, TOOL_SCHEMAS)
+            except Exception as exc:
+                will_retry = attempt <= self.max_retries
+
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "error",
+                        phase="llm_call",
+                        type=type(exc).__name__,
+                        message=str(exc),
+                        latency_ms=millis(started),
+                        attempt=attempt,
+                        max_attempts=self.max_retries + 1,
+                        will_retry=will_retry,
+                    )
+
+                if not will_retry:
+                    raise
+
+                # 指数退避：0.5s → 1s → 2s …… 给对端一点恢复时间
+                self._sleep(self.retry_base_delay * (2 ** (attempt - 1)))
+                continue
+
+            return response, millis(started)
+
+    def _stop(
+        self,
+        wrapped_input: str,
+        answer: str,
+        tool_log: list[str],
+        tool_call_count: int,
+        turn_started: float,
+        stopped_by: str,
+        repeated: str | None = None,
+    ) -> str:
+        """中断当前轮：照样落记忆、照样打点，只是没有正常回答。"""
+        self._commit(wrapped_input, answer, tool_log)
 
         if self.tracer is not None:
-            self.tracer.emit(
-                "answer",
-                content=timeout_answer,
-                tool_calls=tool_call_count,
-                turn_latency_ms=millis(turn_started),
-                stopped_by="max_tool_rounds",
-            )
+            payload: dict[str, Any] = {
+                "content": answer,
+                "tool_calls": tool_call_count,
+                "turn_latency_ms": millis(turn_started),
+                "stopped_by": stopped_by,
+            }
+            if repeated is not None:
+                payload["repeated"] = repeated
+            self.tracer.emit("answer", **payload)
 
-        return timeout_answer
+        return answer
 
     # ---------- 上下文组装 ----------
 
@@ -419,7 +557,7 @@ def _render_answer(answer: str, tool_log: list[str]) -> str:
 def run_agent(
     user_input: str,
     llm_call: LLMCall | None = None,
-    max_rounds: int = 3,
+    max_model_calls: int = DEFAULT_MAX_MODEL_CALLS,
 ) -> str:
     """Keep the Day 4 single-task API compatible with the memory version."""
     if llm_call is None:
@@ -429,21 +567,30 @@ def run_agent(
 
     session = AgentSession(
         llm_call=llm_call,
-        max_messages=10,
-        max_tool_rounds=max_rounds,
+        max_turns=DEFAULT_MAX_TURNS,
+        max_model_calls=max_model_calls,
     )
     return session.ask(user_input)
 
 
 def create_real_agent(
-    max_messages: int = 10,
-    max_tool_rounds: int = 3,
+    max_messages: int | None = None,
+    max_turns: int | None = None,
     keep_recent: int | None = None,
+    keep_recent_turns: int | None = None,
+    max_model_calls: int = DEFAULT_MAX_MODEL_CALLS,
     summarize: bool = True,
     trace_path: str | Path | None = None,
+    max_retries: int = 2,
 ) -> AgentSession:
     """Create an AgentSession connected to the real DeepSeek client.
 
+    装配层的默认值和纯逻辑层不一样，这是有意的：
+
+    - `max_retries=2` —— 生产上必须重试，网络抖动不该让整轮作废
+    - `max_model_calls=6` —— 一次 ask 的成本上界（约 6 次模型请求）
+
+    另外两个开关：
     - `summarize=False` 退回 Day 5 的纯滑窗行为，方便做对照实验
     - `trace_path` 给定时开启 trace，**逐事件 append** 到该 jsonl；
       不给就是零开销，连 `TraceRecorder` 都不创建
@@ -457,9 +604,12 @@ def create_real_agent(
 
     return AgentSession(
         llm_call=chat_completion,
+        max_turns=max_turns,
         max_messages=max_messages,
-        max_tool_rounds=max_tool_rounds,
         keep_recent=keep_recent,
+        keep_recent_turns=keep_recent_turns,
+        max_model_calls=max_model_calls,
         summarizer=summarizer,
         tracer=tracer,
+        max_retries=max_retries,
     )

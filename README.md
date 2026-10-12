@@ -2,7 +2,8 @@
 
 每天的学习讲解、流程图和实测证据在 [`../doc/`](../doc/README.md)：
 `day01-02` 多轮对话 · `day03` Prompt 工程 · `day04` 工具调用 · `day05` 记忆机制 ·
-`day06` 上下文工程 · `day07` 可观测性 / trace。
+`day06` 上下文工程 · `day07` 可观测性 / trace · `day08` 多步收敛。
+代码原理手册（控制流 / 状态机 / 边界条件）在 [`../code_view/`](../code_view/README.md)。
 
 跑测试（**在 `agent_demo/` 目录下**）：
 
@@ -333,11 +334,11 @@ Day 5 那条错位路径已经不会被经过。所以 `test_agent_history_alway
 
 | # | 问题 | 计划 |
 | --- | --- | --- |
-| 1 | `max_messages` 语义仍是「条数」 | D8 改 `max_turns`（D7 推迟） |
+| 1 | `max_messages` 语义仍是「条数」 | ✅ Day 8 已改为 `max_turns` |
 | 2 | `_message_to_dict` 三种分支返回的 dict 形状不一致 | ✅ Day 7 已收口 |
 | 3 | 摘要本身没有长度硬约束，只靠 prompt 里的「不超过 N 字」 | ✅ Day 7 已加代码侧截断 |
-| 4 | `max_tool_rounds=3` 只够 2 次工具调用 | D8 |
-| 5 | `calculator` 会泄漏 `OverflowError` / `ZeroDivisionError` | D8 |
+| 4 | `max_tool_rounds=3` 只够 2 次工具调用 | ✅ Day 8 已改为 `max_model_calls=6` |
+| 5 | `calculator` 会泄漏 `OverflowError` / `ZeroDivisionError` | ✅ Day 8 已收口 |
 | 6 | 压缩发生在 `add()` 里，是**同步阻塞**的（一次压缩 = 一次模型请求） | D15 异步化 |
 
 第 6 条是 Day 6 新引入的真实代价：用户提问触发压缩时，这一轮会多出一次模型调用的延迟。
@@ -441,10 +442,10 @@ python run_trace.py --replay trace/trace-<时间>.jsonl
 
 | # | 问题 | 计划 |
 | --- | --- | --- |
-| 1 | `max_messages` 语义仍是「条数」 | D8 改 `max_turns` |
-| 2 | `max_tool_rounds=3` 只够 2 次工具调用 | D8 |
-| 3 | `calculator` 会泄漏 `OverflowError` / `ZeroDivisionError` | D8 |
-| 4 | 失败的工具调用**不计入**合计里的「出错 N 次」（`find_errors` 只看 `kind=="error"`） | D8 拆成「异常 / 工具失败」两行 |
+| 1 | `max_messages` 语义仍是「条数」 | ✅ Day 8 已改为 `max_turns` |
+| 2 | `max_tool_rounds=3` 只够 2 次工具调用 | ✅ Day 8 已改为 `max_model_calls` |
+| 3 | `calculator` 会泄漏 `OverflowError` / `ZeroDivisionError` | ✅ Day 8 已收口（只抛 `ValueError`） |
+| 4 | 失败的工具调用**不计入**合计里的「出错 N 次」 | ✅ Day 8 已拆成「异常 / 工具失败」两行，并修掉根因（`ok` 标志本身是错的） |
 | 5 | **没采集 `reasoning_content`**（计划 D7 里写的 "thought"）—— 现在用的 `deepseek-chat` 没这个字段 | 用上推理模型时补 |
 | 6 | trace 文件无轮转、无上限，长跑会一直涨 | 后续 |
 
@@ -455,4 +456,143 @@ python run_trace.py --replay trace/trace-<时间>.jsonl
 > 想验证：`python -m pytest test/test_trace.py --basetemp=<一个全新空目录>` → 0.14 秒；去掉 `--basetemp` 再跑 → 3.6 秒。
 
 > 这一天同样**没有**新建 `scripts/` —— 理由见 `doc/day06.md` 第十节。
+
+## Day 8: Multi-step Convergence
+
+运行第八天实验程序：
+
+```powershell
+python run_memory_agent.py     # 记忆窗口 5 轮、一次 ask 最多 6 次模型请求
+python run_trace.py            # 同上，额外打 trace；trace / stats 命令看回放
+```
+
+本日代码包含三个互不替代的机制（**轮次预算挡「话多」，无进展检测挡「打转」，重试挡「抖动」**）：
+
+- **轮次预算**：`max_turns`（记忆，单位是「轮」）+ `max_model_calls`（一次 ask 的请求次数，默认 6）
+- **无进展检测**：连续两批工具调用 `(工具名, 参数)` 完全相同时中断，**拦在工具执行之前**
+- **失败重试**：指数退避（0.5s → 1s），只包**单次请求**，不会重放整轮
+
+顺带收口：
+
+- `ToolResult`：`text` 给模型看、`ok` / `reason` 给程序看 —— 不再靠文本前缀猜成败
+- `calculator` 只抛 `ValueError`（`ZeroDivisionError` / `OverflowError` / `SyntaxError` 全部翻译成中文说明）
+- trace 合计把「异常」和「工具失败」拆成两行；error 事件显示是第几次尝试；answer 事件显示中断原因
+
+### 三个预算的分工
+
+| 参数 | 管什么 | 默认 |
+| --- | --- | --- |
+| `max_turns` | 记忆窗口装多少轮历史 | 5（= 10 条消息） |
+| `max_model_calls` | 一次 `ask()` 最多请求模型几次 | 6（= 最多 5 次工具调用 + 1 次回答） |
+| `max_retries` | 单次请求失败后最多重试几次 | 纯逻辑层 `0` / 装配层 `2` |
+
+`max_retries` 的默认值分两层是刻意的：单测要确定性，生产要可用性。
+
+### 关键改动：无进展检测拦在执行之前
+
+```python
+signature = tuple(
+    (_get_tool_call_value(tc, "name") or "",
+     _get_tool_call_value(tc, "arguments") or "{}")
+    for tc in tool_calls
+)
+repeat_count = repeat_count + 1 if signature == last_signature else 1
+last_signature = signature
+
+if repeat_count >= NO_PROGRESS_LIMIT:
+    return self._stop(..., stopped_by="no_progress", repeated=signature[0][1])
+```
+
+两个理由：同样的 (工具, 参数) 上一次就把结果写进上下文了，再执行一次没有新信息；
+而且换成「下单」「发邮件」这类有副作用的工具之后，「先执行再判断」是真的重复下单。
+
+### 实测：一份 4 轮 trace
+
+```text
+── 第 1 轮 ── 3 次工具调用后回答（旧默认 max_tool_rounds=3 跑不完）
+   1. → 请求  2 条 ['system', 'user']
+   3. ⚙ 工具  calculator({"expression": "12 * 8"})  0.08ms ok → 96
+   6. ⚙ 工具  calculator({"expression": "96 + 4"})  0.13ms ok → 100
+   9. ⚙ 工具  search_notes({"query": "Agent"})  0.71ms ok → 笔记主题：Agent…
+  12. ✓ 回答  12 * 8 = 96，加 4 是 100。笔记里说 Agent 包含工具调用和记忆。
+
+── 第 2 轮 ── 打转被拦下（2 个 request，只有 1 个 tool_call）
+   5. ← 响应  0.01ms  要调 calculator
+   6. ✓ 回答  检测到连续重复的工具调用（calculator 参数完全相同），判断为无法推进，任务已停止。
+              [中断：检测到重复调用]
+
+── 第 3 轮 ── 抖动两次后成功
+   2. ✗ 出错  llm_call 阶段 RuntimeError: 模型服务 502（第 1/3 次尝试，将重试）
+   3. ✗ 出错  llm_call 阶段 RuntimeError: 模型服务 502（第 2/3 次尝试，将重试）
+   5. ✓ 回答  刚才那两次请求抖动，重试成功了：答案是 2。  本轮 1517.58ms
+
+── 第 4 轮 ── 工具失败 ≠ 异常
+   3. ⚙ 工具  calculator({"expression": "1/0"})  0.06ms 失败 → 工具拒绝执行：除数不能为 0
+
+合计：
+  模型请求  9 次
+  token     12300（prompt 12000 + completion 300）
+  前缀缓存  命中率 97.0%（命中 11640 / 未命中 360）
+  异常      2 次
+      · 第 3 轮 llm_call：RuntimeError 模型服务 502（第 1/3 次尝试，将重试）
+      · 第 3 轮 llm_call：RuntimeError 模型服务 502（第 2/3 次尝试，将重试）
+  工具失败  1 次
+      · 第 4 轮 calculator：rejected
+```
+
+### 一个跑起来才发现的 bug：`ok` 标志是错的
+
+第一版回放长这样：
+
+```text
+   3. ⚙ 工具  calculator({"expression": "1/0"})  0.05ms ok → 工具拒绝执行：除数不能为 0
+  工具失败  无
+```
+
+被拒绝了却写着 `ok`。根因是 **`execute_tool` 契约上不抛异常**，
+而调用方只能靠「有没有抛异常」判断成败 —— 于是「工具被拒绝」和「工具成功」长得一模一样。
+**布尔信息被编码进了人类可读的字符串。**
+
+修法：`execute_tool` 改成返回 `ToolResult(text, ok, reason)`，文本从结构里派生。
+没有另加一个函数保持旧接口 —— 两个入口必须有同一份判定逻辑，而「同一份逻辑放两处」在 Day 6 已经证明会漂移。
+
+### 验证
+
+```powershell
+python -m pytest                                          # 137 passed（Day 7 是 103）
+python -m pytest -q -k "no_progress or retry or budget"    # 只看今天的机制
+python run_trace.py                                       # 交互式亲眼看
+```
+
+12 组探针（把改动逐条还原成 Day 7 行为，看测试接不接得住；一次性实验，未留在仓库）：
+
+| 探针 | 还原成 | 结果 |
+| --- | --- | --- |
+| 1 | `max_turns` 当条数用 | ✅ 2 条失败 |
+| 2 | 关掉无进展检测 | ✅ 3 条失败 |
+| 3 | 阈值改成 1 | ✅ 3 条失败 |
+| 4 | 签名只看工具名 | ✅ 2 条失败 |
+| 5 | 失败从不重试 | ✅ 2 条失败 |
+| 6 | 退避改成固定间隔 | ✅ 2 条失败 |
+| 7 | `calculator` 不拦 `ZeroDivisionError` | ✅ 3 条失败 |
+| 8 | `execute_tool` 不区分 `ValueError` | ✅ 2 条失败 |
+| 9 | `find_tool_failures` 退回只看 `kind=="error"` | ✅ 2 条失败 |
+| 10 | `error` 渲染不显示重试次数 | ✅ 1 条失败 |
+| 11 | `answer` 不渲染中断原因 | ✅ 1 条失败 |
+| 12 | 工具结果永远标成成功 | ✅ 1 条失败 |
+
+**12/12 全中**（Day 7 是 6/6，Day 6 是 5/6）。
+
+### 已知问题
+
+| # | 问题 | 计划 |
+| --- | --- | --- |
+| 1 | 无进展检测只看「完全相同的签名」，挡不住「参数每次变一点」的绕圈 | D9 自我反思 |
+| 2 | `AgentSession` 构造参数已有 11 个 | 下一轮改配置时抽 `AgentConfig` |
+| 3 | 没采集 `reasoning_content` | 用上推理模型时 |
+| 4 | trace 文件无轮转 | 后续 |
+
+> 这一天也**没有**新建 `scripts/` —— 理由见 `doc/day06.md` 第十节。
+>
+> 📖 三个机制的控制流、状态机、边界条件在 [`../code_view/day08-多步收敛.md`](../code_view/day08-多步收敛.md)。
 

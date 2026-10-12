@@ -1,6 +1,6 @@
 import pytest
 
-from app.memory import ConversationMemory, format_messages
+from app.memory import MESSAGES_PER_TURN, ConversationMemory, format_messages
 
 
 def test_memory_stores_messages():
@@ -341,3 +341,75 @@ def test_summary_compression_keeps_what_hard_truncation_drops():
     assert len(window) <= limit
     assert compressed.compressed_count + len(compressed) == 2 * len(turns)
     assert window.compressed_count == 0, "纯滑窗没有摘要，也就无从记账"
+
+
+# ============ Day 8：容量的两种说法（轮 / 条） ============
+
+
+def test_memory_max_turns_means_turns_not_messages():
+    """`max_turns=3` 装得下 3 轮；第 4 轮进来时把最老的一轮挤出去。"""
+    memory = ConversationMemory(max_turns=3)
+
+    assert memory.max_messages == 3 * MESSAGES_PER_TURN == 6
+
+    for index in range(4):
+        memory.add_user_message(f"问题 {index}")
+        memory.add_assistant_message(f"答案 {index}")
+
+    contents = [message["content"] for message in memory.get_messages()]
+
+    # 只留最近 3 轮：问题 1/2/3，问题 0 被挤掉
+    assert contents == [
+        "问题 1",
+        "答案 1",
+        "问题 2",
+        "答案 2",
+        "问题 3",
+        "答案 3",
+    ]
+
+
+def test_memory_max_turns_equals_ten_messages():
+    """旧默认 `max_messages=10` 和新默认 `max_turns=5` 是同一件事。"""
+    by_turns = ConversationMemory(max_turns=5)
+    by_messages = ConversationMemory(max_messages=10)
+
+    assert by_turns.max_messages == by_messages.max_messages == 10
+    assert by_turns.max_turns == by_messages.max_turns == 5
+    assert by_turns.keep_recent == by_messages.keep_recent == 5
+
+
+def test_memory_rejects_two_capacity_units_at_once():
+    with pytest.raises(ValueError, match="只能给一个"):
+        ConversationMemory(max_turns=5, max_messages=10)
+
+    with pytest.raises(ValueError, match="只能给一个"):
+        ConversationMemory(max_turns=5, keep_recent=2, keep_recent_turns=1)
+
+
+def test_memory_rejects_zero_turns():
+    with pytest.raises(ValueError):
+        ConversationMemory(max_turns=0)
+
+    with pytest.raises(ValueError):
+        ConversationMemory(max_turns=4, keep_recent_turns=0)
+
+
+def test_memory_keep_recent_turns_is_counted_in_turns():
+    memory = ConversationMemory(max_turns=6, keep_recent_turns=2)
+
+    assert memory.keep_recent == 4
+    assert memory.keep_recent_turns == 2
+    assert memory.keep_recent <= memory.max_messages
+
+
+def test_memory_odd_window_still_reachable_through_messages():
+    """条数入口存在的理由：只有它能表达奇数窗口，那条配对守卫才不是死代码。"""
+    memory = ConversationMemory(max_messages=5)
+    assert memory.max_messages == 5
+
+    for index in range(6):
+        memory.add_user_message(f"问题 {index}")
+        memory.add_assistant_message(f"答案 {index}")
+
+    assert memory.get_messages()[0]["role"] == "user"

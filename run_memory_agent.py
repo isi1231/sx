@@ -3,11 +3,11 @@ from app.agent import create_real_agent
 
 def main() -> None:
     agent = create_real_agent(
-        max_messages=10,
-        max_tool_rounds=3,
+        max_turns=5,
+        max_model_calls=6,
     )
 
-    print("第 6 天上下文工程 Agent 已启动。")
+    print("第 8 天多步收敛 Agent 已启动。")
     print("输入 clear 清空记忆。")
     print("输入 memory 查看当前记忆。")
     print("输入 summary 查看旧对话摘要。")
